@@ -514,7 +514,7 @@
     {
       "platform": "facebook-messenger",
       "name": "Facebook Messenger Gateway",
-      "is_active": true
+      "is_active": false
     },
     {
       "platform": "facebook-messenger",
