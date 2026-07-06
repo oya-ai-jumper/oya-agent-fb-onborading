@@ -102,6 +102,12 @@ config_schema:
       description: "When on, the skill calls the Xano MCP `get_gmb` tool with the lead's email after they provide it; if the record's `nonPayingClient` is true → returning-customer reply, false → active-account reply. Requires XANO_MCP_URL + XANO_MCP_BEARER credentials."
       default: false
       group: "xano"
+    xano_verify_backoff_schedule:
+      type: string
+      label: "Xano post-onboarding verify backoff (seconds, comma-separated)"
+      description: "After the browser playback successfully submits the Bubble form, the script polls Xano's `get_gmb` to verify the record was synced before sending the Calendly link. Each value is a `time.sleep` before the next attempt — total of the schedule is the maximum window we'll wait for Bubble→Xano to sync. Default 1,2,4,8,15,30,60 (~120s) suits Jumper's current webhook latency profile; live prod 2026-05-19 showed the prior 30s window was too short. Lower if your sync is faster; raise if you see false-negative `onboarding_error` messages on successfully-onboarded leads."
+      default: "1,2,4,8,15,30,60"
+      group: "xano"
     min_reviews:
       type: integer
       label: "Minimum review count"
@@ -186,7 +192,7 @@ config_schema:
     disqual_website:
       type: textarea
       label: "Disqualified — no website"
-      default: "Looks like your Google Business Profile doesn't meet all of our requirements. Please add a website to your profile and try again."
+      default: "Looks like your Google Business Profile doesn't have a website on file. Please add a URL to the 'Website' field of your Google Business Profile (not just a social link or a description) and try again."
       group: "messages"
     disqual_reviews:
       type: textarea
@@ -236,8 +242,14 @@ config_schema:
     onboarding_error:
       type: textarea
       label: "Onboarding error / fallback"
-      description: "Shown when the agent's browser handoff fails or times out."
+      description: "Shown when the agent's browser handoff actually FAILED (form submission rejected by Bubble, network error, timeout before submit). Distinct from `onboarding_unverified_optimistic` — that one fires when the playback succeeded but Xano sync hasn't completed yet."
       default: "Got it. I've logged your details and the team will reach out shortly to finish setting up your dashboard."
+      group: "messages"
+    onboarding_unverified_optimistic:
+      type: textarea
+      label: "Onboarding unverified (playback succeeded, Xano sync pending)"
+      description: "Sent when the browser playback successfully submitted the form to Bubble, but the post-submit Xano `get_gmb` lookup didn't confirm the record within the verify window (typically because Bubble→Xano webhook sync takes longer than the window). The lead's account IS being created — sending the Calendly link gives them a clear path forward without misleading them into thinking it failed. `{calendly_url}` interpolates. Live prod 2026-05-19: Wallace Construction Group LLC / Murphys PubHouse / Bridgeview Pet Wellness Clinic all confirmed in Xano shortly AFTER the bot had already sent the misleading 'team will call you' onboarding_error template."
+      default: "Awesome! Your free trial of Jumper Local is being set up. Schedule a quick call with our team here to go over your results: {calendly_url}"
       group: "messages"
     onboarding_queued_notice:
       type: textarea
@@ -256,6 +268,48 @@ config_schema:
       label: "Address-pasted-as-name re-prompt"
       description: "Sent when the lead pastes a street address into the business-name slot. Catches inputs like '11689 Olio Rd Geist, McCordsville, IN 46037' before they hit Places (which would otherwise return a literal-address entity that then fails qualification with a misleading no-business-hours message)."
       default: "Looks like that's an address! What's the name of your business?"
+      group: "messages"
+    ask_business_name:
+      type: textarea
+      label: "Generic 'what's your business?' re-prompt"
+      description: "Sent in awaiting_name when the lead's input clearly isn't a business name and no classifier hint can route the turn elsewhere — gibberish, hostile chitchat, acknowledgements, off-topic chatter. Distinct from the address-specific re-prompt above because the lead never mentioned an address; using 'at that address' phrasing here is confusing."
+      default: "Could you share your business name?"
+      group: "messages"
+    disqual_recheck_still_failing:
+      type: textarea
+      label: "Recheck still failing — softer protest reply"
+      description: "Sent from the 2nd disqualified-state recheck onward when the GMB still doesn't qualify on the same reason. Replaces the canned per-reason template (which would otherwise repeat verbatim and feel like the bot is gaslighting the lead). `{what_is_missing}` interpolates to a concrete description of the unmet requirement. Includes a hint about the 'verified' override path."
+      default: "Hmm, Google is still showing the same issue on your profile ({what_is_missing}). Sometimes it takes a few minutes for changes to propagate — could you double-check the update is saved on your Google Business Profile and try again in a moment? If you've verified it's there, reply 'verified' and our team will double-check on their end."
+      group: "messages"
+    disqual_override_acknowledged:
+      type: textarea
+      label: "Manual override acknowledged"
+      description: "Fired when the lead types 'verified' / 'override' / 'i confirmed' / 'i added it' after 2+ recheck attempts. Bypasses the canned disqual loop, sets `manual_review_requested=true` on the lead's state for anna+team to spot-check in the dashboard, and resumes onboarding at awaiting_full_name. Trade-off: a small number of unqualified leads slip into onboarding, but the alternative (looping forever) is worse UX especially when the Places API genuinely has stale data."
+      default: "Got it — I'll flag this for our team to verify on their side. Let's keep going. What's your full name?"
+      group: "messages"
+    confirm_closest_listing:
+      type: textarea
+      label: "Confirm — closest listing when address snap drifted"
+      description: "Sent when the lead pasted an address but nearby_search snapped to a business at a noticeably-different street number (e.g. lead typed '9001 E 116th St' but Google's nearest business is at '8997 E 116th St'). The default confirm template would silently substitute the snapped address, which feels like the bot lied. This template is transparent about the snap. `{name}` and `{address}` interpolate."
+      default: "I'm not seeing a business directly at that address. The closest one is:\n{name}\n{address}\n\nIs this your business? If not, just share the actual name and I'll search again."
+      group: "messages"
+    confirm_one_with_alternatives:
+      type: textarea
+      label: "Confirm — strip mall with multiple businesses at same address"
+      description: "Sent when nearby_search returns 2+ distinct businesses sharing the same street number (strip mall scenario). Surfaces the closest candidate AND lists 3-4 sibling business names so the lead can pick by typing the right name. `{name}` / `{address}` interpolate the top candidate; `{alternatives}` is a comma-separated list of sibling names. Live prod 2026-05-19: lead pasted '11630 Olio Rd' (Fishers IN — a 6+ business strip mall) and bot offered only Olio Nail & Spa silently, hiding Vita Dental / Jimmy John's / MOCHINUT / Papa Murphy's at the same address."
+      default: "Is this your business?\n{name}\n{address}\n\nI also see these at the same address: {alternatives}. If yours is one of those, just reply with the name."
+      group: "messages"
+    ask_email_again_test_address:
+      type: textarea
+      label: "Reject placeholder email — re-ask"
+      description: "Sent when the lead's email is an obvious placeholder (test@test.com, foo@bar.com, anything@example.com, test+test@email.com, etc.). Catches bad data BEFORE the browser playback into Bubble would attempt to register it and fail at form-validation. Real leads with unusual but valid emails (gmail with plus-tags, custom domains, etc.) are not affected."
+      default: "That looks like a placeholder email — could you share the actual email you'll use to log into your dashboard?"
+      group: "messages"
+    ask_phone_again_test_number:
+      type: textarea
+      label: "Reject placeholder phone — re-ask"
+      description: "Sent when the phone number is an obvious placeholder: all-same-digit (5555555555), strictly sequential (1234567890), or a US 555-01XX fictional number. Real phone numbers like 3175551234 (where 555 is in the local part not the exchange position) pass through."
+      default: "That looks like a placeholder phone number — could you share the real number where you'd like to receive your login details?"
       group: "messages"
     completion_followup_ack:
       type: textarea

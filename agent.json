@@ -79,7 +79,7 @@
       "catalog_type": "addon",
       "config": {
         "bot_name": "Hannah",
-        "ask_email": "Perfect. I'll create your dashboard now. What's the best email for your login?",
+        "ask_email": "Perfect. I'll create your Jumper Local dashboard now. What's the best email for your login?",
         "ask_phone": "And what phone number can I text your login details to?",
         "not_found": "Hmm, I wasn't able to find that listing on Google. Could you double-check the name? It should appear exactly as it does when you search your business on Google Maps.",
         "min_rating": 3,
@@ -97,23 +97,23 @@
         "trigger_keyword": "MAPS",
         "debounce_seconds": 4,
         "onboarding_error": "Got it. I've logged your details and the team will reach out shortly to finish setting up your dashboard.",
-        "welcome_template": "Hey there! I'm {bot_name} \ud83d\udc4b Give me your business name. Going to look you up to see if we can help",
+        "welcome_template": "Hey {lead_first_name}! I'm {bot_name} \ud83d\udc4b What's your business name? Looking you up now.",
         "enable_xano_check": true,
         "idle_ping_seconds": "180",
         "self_company_name": "Jumper Media",
         "idle_ping_template": "Hey, are you still there? \ud83d\udc4b Just need a couple more details to finish setting up your account.",
         "returning_template": "Welcome back! Schedule a call with our team to reactivate your account:\n{calendly_url}",
         "self_company_response": "Hey thats us, whats YOUR business name? :)",
-        "calendly_book_template": "Awesome! Your free trial of Jumper Local has been initiated. You should see improved rankings in less than a week. The last step is to schedule with a specialist to go over your results. Choose a time that works best for you here: {calendly_url}",
+        "calendly_book_template": "Got it! Someone from our team will give you a quick call shortly to finish setting up your free Jumper Local trial.",
         "returning_calendly_url": "https://calendly.com/jmpsales/google-ranking-increase-jumper-local",
         "active_account_template": "Looks like you already have active account with us! Please login https://local.jumpermedia.co/ or contact customer support at {support_email}",
-        "completion_followup_ack": "Thanks! The team has your info and will be in touch shortly. Hang tight \ud83d\ude4c",
+        "completion_followup_ack": "Got it! Someone from our team will give you a quick call shortly to finish setting up your free Jumper Local trial.",
         "preparing_nudge_seconds": "30",
         "re_engage_after_seconds": "600",
         "onboarding_queued_notice": "Just running a few checks. Back in a sec \ud83d\udc40",
         "still_preparing_template": "Almost done. Just finishing up your account, one sec \ud83d\udc40",
         "onboarding_timeout_seconds": 120,
-        "preparing_dashboard_template": "Awesome! Our team is onboarding you now. Hang tight, you'll get a link in a sec \ud83d\ude4c",
+        "preparing_dashboard_template": "Awesome! Our team is onboarding you now. Hang tight, finishing up your account \ud83d\udc40",
         "onboarding_slot_lease_seconds": 200,
         "onboarding_slot_retry_seconds": 5
       },
@@ -222,7 +222,7 @@
             "type": "textarea",
             "group": "messages",
             "label": "Disqualified \u2014 no website",
-            "default": "Looks like your Google Business Profile doesn't meet all of our requirements. Please add a website to your profile and try again."
+            "default": "Looks like your Google Business Profile doesn't have a website on file. Please add a URL to the 'Website' field of your Google Business Profile (not just a social link or a description) and try again."
           },
           "trigger_keyword": {
             "type": "string",
@@ -243,7 +243,7 @@
             "group": "messages",
             "label": "Onboarding error / fallback",
             "default": "Got it. I've logged your details and the team will reach out shortly to finish setting up your dashboard.",
-            "description": "Shown when the agent's browser handoff fails or times out."
+            "description": "Shown when the agent's browser handoff actually FAILED (form submission rejected by Bubble, network error, timeout before submit). Distinct from `onboarding_unverified_optimistic` \u2014 that one fires when the playback succeeded but Xano sync hasn't completed yet."
           },
           "welcome_template": {
             "type": "textarea",
@@ -251,6 +251,13 @@
             "label": "Welcome message",
             "default": "Hey there! I'm {bot_name} \ud83d\udc4b Give me your business name. Going to look you up to see if we can help",
             "description": "Sent on the trigger keyword (MAPS) or when a brand-new conversation starts. {bot_name} interpolates."
+          },
+          "ask_business_name": {
+            "type": "textarea",
+            "group": "messages",
+            "label": "Generic 'what's your business?' re-prompt",
+            "default": "Could you share your business name?",
+            "description": "Sent in awaiting_name when the lead's input clearly isn't a business name and no classifier hint can route the turn elsewhere \u2014 gibberish, hostile chitchat, acknowledgements, off-topic chatter. Distinct from the address-specific re-prompt above because the lead never mentioned an address; using 'at that address' phrasing here is confusing."
           },
           "enable_xano_check": {
             "type": "boolean",
@@ -322,6 +329,13 @@
             "default": "Thanks! The team has your info and will be in touch shortly. Hang tight \ud83d\ude4c",
             "description": "Sent ONCE when a lead replies within `re_engage_after_seconds` of the conversation ending (success, failure, or timeout). Replaces the wizard-restart that used to happen on every post-completion message \u2014 keeps the lead from being re-prompted for business name / name / email / phone all over again. Subsequent inbounds during the cooldown window stay silent."
           },
+          "confirm_closest_listing": {
+            "type": "textarea",
+            "group": "messages",
+            "label": "Confirm \u2014 closest listing when address snap drifted",
+            "default": "I'm not seeing a business directly at that address. The closest one is:\n{name}\n{address}\n\nIs this your business? If not, just share the actual name and I'll search again.",
+            "description": "Sent when the lead pasted an address but nearby_search snapped to a business at a noticeably-different street number (e.g. lead typed '9001 E 116th St' but Google's nearest business is at '8997 E 116th St'). The default confirm template would silently substitute the snapped address, which feels like the bot lied. This template is transparent about the snap. `{name}` and `{address}` interpolate."
+          },
           "preparing_nudge_seconds": {
             "type": "integer",
             "group": "thresholds",
@@ -357,12 +371,54 @@
             "default": 120,
             "description": "If the agent's browser-onboarding step doesn't complete within this window, the lead receives onboarding_error and the conversation ends. Also acts as the queue-depth cap \u2014 leads waiting for a slot longer than this get the polite fallback."
           },
+          "ask_phone_again_test_number": {
+            "type": "textarea",
+            "group": "messages",
+            "label": "Reject placeholder phone \u2014 re-ask",
+            "default": "That looks like a placeholder phone number \u2014 could you share the real number where you'd like to receive your login details?",
+            "description": "Sent when the phone number is an obvious placeholder: all-same-digit (5555555555), strictly sequential (1234567890), or a US 555-01XX fictional number. Real phone numbers like 3175551234 (where 555 is in the local part not the exchange position) pass through."
+          },
+          "ask_email_again_test_address": {
+            "type": "textarea",
+            "group": "messages",
+            "label": "Reject placeholder email \u2014 re-ask",
+            "default": "That looks like a placeholder email \u2014 could you share the actual email you'll use to log into your dashboard?",
+            "description": "Sent when the lead's email is an obvious placeholder (test@test.com, foo@bar.com, anything@example.com, test+test@email.com, etc.). Catches bad data BEFORE the browser playback into Bubble would attempt to register it and fail at form-validation. Real leads with unusual but valid emails (gmail with plus-tags, custom domains, etc.) are not affected."
+          },
           "preparing_dashboard_template": {
             "type": "textarea",
             "group": "messages",
             "label": "Preparing-dashboard preamble (sent right after phone)",
             "default": "Awesome! Our team is onboarding you now. Hang tight, you'll get a link in a sec \ud83d\ude4c",
             "description": "Sent immediately after the lead provides their phone \u2014 covers the ~60s window during which the browser playback + Xano verify run silently, so the lead has acknowledgement they're being processed. Customer-facing \u2014 DO NOT mention browser / automation / playback. Frame as the team taking care of them."
+          },
+          "xano_verify_backoff_schedule": {
+            "type": "string",
+            "group": "xano",
+            "label": "Xano post-onboarding verify backoff (seconds, comma-separated)",
+            "default": "1,2,4,8,15,30,60",
+            "description": "After the browser playback successfully submits the Bubble form, the script polls Xano's `get_gmb` to verify the record was synced before sending the Calendly link. Each value is a `time.sleep` before the next attempt \u2014 total of the schedule is the maximum window we'll wait for Bubble\u2192Xano to sync. Default 1,2,4,8,15,30,60 (~120s) suits Jumper's current webhook latency profile; live prod 2026-05-19 showed the prior 30s window was too short. Lower if your sync is faster; raise if you see false-negative `onboarding_error` messages on successfully-onboarded leads."
+          },
+          "confirm_one_with_alternatives": {
+            "type": "textarea",
+            "group": "messages",
+            "label": "Confirm \u2014 strip mall with multiple businesses at same address",
+            "default": "Is this your business?\n{name}\n{address}\n\nI also see these at the same address: {alternatives}. If yours is one of those, just reply with the name.",
+            "description": "Sent when nearby_search returns 2+ distinct businesses sharing the same street number (strip mall scenario). Surfaces the closest candidate AND lists 3-4 sibling business names so the lead can pick by typing the right name. `{name}` / `{address}` interpolate the top candidate; `{alternatives}` is a comma-separated list of sibling names. Live prod 2026-05-19: lead pasted '11630 Olio Rd' (Fishers IN \u2014 a 6+ business strip mall) and bot offered only Olio Nail & Spa silently, hiding Vita Dental / Jimmy John's / MOCHINUT / Papa Murphy's at the same address."
+          },
+          "disqual_override_acknowledged": {
+            "type": "textarea",
+            "group": "messages",
+            "label": "Manual override acknowledged",
+            "default": "Got it \u2014 I'll flag this for our team to verify on their side. Let's keep going. What's your full name?",
+            "description": "Fired when the lead types 'verified' / 'override' / 'i confirmed' / 'i added it' after 2+ recheck attempts. Bypasses the canned disqual loop, sets `manual_review_requested=true` on the lead's state for anna+team to spot-check in the dashboard, and resumes onboarding at awaiting_full_name. Trade-off: a small number of unqualified leads slip into onboarding, but the alternative (looping forever) is worse UX especially when the Places API genuinely has stale data."
+          },
+          "disqual_recheck_still_failing": {
+            "type": "textarea",
+            "group": "messages",
+            "label": "Recheck still failing \u2014 softer protest reply",
+            "default": "Hmm, Google is still showing the same issue on your profile ({what_is_missing}). Sometimes it takes a few minutes for changes to propagate \u2014 could you double-check the update is saved on your Google Business Profile and try again in a moment? If you've verified it's there, reply 'verified' and our team will double-check on their end.",
+            "description": "Sent from the 2nd disqualified-state recheck onward when the GMB still doesn't qualify on the same reason. Replaces the canned per-reason template (which would otherwise repeat verbatim and feel like the bot is gaslighting the lead). `{what_is_missing}` interpolates to a concrete description of the unmet requirement. Includes a hint about the 'verified' override path."
           },
           "onboarding_slot_lease_seconds": {
             "type": "integer",
@@ -384,6 +440,13 @@
             "label": "Address-pasted-as-name re-prompt",
             "default": "Looks like that's an address! What's the name of your business?",
             "description": "Sent when the lead pastes a street address into the business-name slot. Catches inputs like '11689 Olio Rd Geist, McCordsville, IN 46037' before they hit Places (which would otherwise return a literal-address entity that then fails qualification with a misleading no-business-hours message)."
+          },
+          "onboarding_unverified_optimistic": {
+            "type": "textarea",
+            "group": "messages",
+            "label": "Onboarding unverified (playback succeeded, Xano sync pending)",
+            "default": "Awesome! Your free trial of Jumper Local is being set up. Schedule a quick call with our team here to go over your results: {calendly_url}",
+            "description": "Sent when the browser playback successfully submitted the form to Bubble, but the post-submit Xano `get_gmb` lookup didn't confirm the record within the verify window (typically because Bubble\u2192Xano webhook sync takes longer than the window). The lead's account IS being created \u2014 sending the Calendly link gives them a clear path forward without misleading them into thinking it failed. `{calendly_url}` interpolates. Live prod 2026-05-19: Wallace Construction Group LLC / Murphys PubHouse / Bridgeview Pet Wellness Clinic all confirmed in Xano shortly AFTER the bot had already sent the misleading 'team will call you' onboarding_error template."
           }
         }
       },
@@ -451,6 +514,11 @@
     {
       "platform": "facebook-messenger",
       "name": "Facebook Messenger Gateway",
+      "is_active": true
+    },
+    {
+      "platform": "facebook-messenger",
+      "name": "JumperMedia",
       "is_active": true
     }
   ],

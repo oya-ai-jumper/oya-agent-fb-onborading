@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -147,12 +148,18 @@ def _looks_like_address(text: str) -> bool:
     the misleading "your Google Business Profile doesn't meet our
     requirements" message. Better to re-prompt for the business name.
 
-    Two strong signals:
+    Classifier hint wins when present and high-confidence; otherwise the
+    regex floor below decides. Two strong regex signals:
       1. Starts with digits AND contains a street suffix
          (e.g. "11689 Olio Rd Geist", "1051 S Coast Hwy 101").
       2. Contains a US state code preceded by a comma or space, with
          digits anywhere (e.g. "Fishers, IN 46037").
     """
+    hint = matcher.hint_is_address(text)
+    if hint is True:
+        return True
+    if hint is False:
+        return False
     s = (text or "").strip()
     if not s:
         return False
@@ -178,11 +185,17 @@ def _looks_like_person_name(text: str) -> bool:
     fall through to a refined name search and Places would return
     something like "Anna Smith Studio" — completely off track.
 
+    Classifier hint wins. Otherwise:
     Heuristic: 2-3 alphabetic tokens, none of which is a business suffix
     (`coffee`, `cafe`, `inc`, `llc`, etc.). The conservative side errors
     toward "looks like a business name" so an actual business reply
     (e.g. "Wake N Bakery" — 3 tokens, "Bakery" is a business suffix)
     still goes through the re-search path."""
+    hint = matcher.hint_is_person_name(text)
+    if hint is True:
+        return True
+    if hint is False:
+        return False
     s = (text or "").strip()
     if not s or len(s) > 60:
         return False
@@ -194,6 +207,247 @@ def _looks_like_person_name(text: str) -> bool:
     if any(p.lower().rstrip(".") in _BUSINESS_TOKENS for p in parts):
         return False
     return True
+
+
+_NON_DATA_INTENTS = {
+    "question", "small_talk", "greeting", "closing", "affirmative",
+    "negative", "complaint", "off_topic",
+}
+
+
+_NEGATION_PREFIXES = (
+    "no its ", "no it's ", "no it is ",
+    "no actually ", "no actaully ", "no but actually ",
+    "no but ", "no wait ", "no the ", "no my ",
+    "nope its ", "nope it's ", "nope actually ",
+    "not that one its ", "not that one it's ", "not that one ",
+    "wrong its ", "wrong it's ", "wrong one its ",
+    "actually its ", "actually it's ", "actually ",
+    "no ",
+)
+
+
+_STREET_NUMBER_RE = re.compile(r"^\s*(\d+)")
+
+
+def _street_number(addr: str) -> str | None:
+    """Extract the leading street number from an address string. Returns
+    None when no digit-prefixed token exists. Used to detect address-
+    snap mismatches: when the lead types '9001 E 116th St' and Places'
+    nearby_search returns a business at '8997 E 116th St', the street
+    numbers (9001 vs 8997) differ — surface that to the lead instead of
+    silently substituting the snapped address as if it were what they typed."""
+    if not addr:
+        return None
+    m = _STREET_NUMBER_RE.match(addr)
+    return m.group(1) if m else None
+
+
+def _addresses_differ_significantly(lead_input: str, candidate_address: str) -> bool:
+    """True iff the street numbers in the two address strings differ.
+    Conservative: requires BOTH to have a parseable street number; if
+    either is missing, treats as 'no mismatch detected' so we don't
+    over-surface for inputs that aren't street-number-prefixed (e.g.
+    'Sears Tower Chicago' / 'Madison Square Garden').
+    Returns False if numbers match exactly. Returns False on near
+    matches (±2) since a small offset is often the same building
+    indexed differently across Google's data sources."""
+    a = _street_number(lead_input)
+    b = _street_number(candidate_address)
+    if not a or not b:
+        return False
+    try:
+        return abs(int(a) - int(b)) > 2
+    except ValueError:
+        return a != b
+
+
+def _siblings_at_same_address(top: dict, candidates: list[dict],
+                              max_count: int = 4) -> list[str]:
+    """Return up to `max_count` names of OTHER businesses in
+    `candidates` that share the same street number as `top`. Used to
+    detect strip-mall scenarios where the lead pastes an address and
+    multiple businesses share it. Without this, nearby_search's
+    auto-pick of the closest candidate hides the alternatives.
+
+    Conservative: only includes siblings with a parseable street
+    number that matches the top candidate's. If either doesn't have a
+    street number, returns an empty list (no surprise alternatives).
+    """
+    if not top or not candidates:
+        return []
+    top_num = _street_number(top.get("formatted_address", ""))
+    if not top_num:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    top_place_id = top.get("place_id") or ""
+    for c in candidates:
+        if (c.get("place_id") or "") == top_place_id:
+            continue
+        c_num = _street_number(c.get("formatted_address", ""))
+        if c_num != top_num:
+            continue
+        name = (c.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+        if len(out) >= max_count:
+            break
+    return out
+
+
+def _strip_negation_prefix(text: str) -> str:
+    """Strip leading negation/correction phrases from a refined business
+    name. Used when the lead rejects a GMB offer AND provides the
+    corrected name in the same message, like 'no its Starbucks Coffee'
+    or 'actually it's Cafe Noricha'. Without this, the raw text feeds
+    Places.text_search → fuzzy matches on the negation tokens too,
+    which causes weird results ('not that one Starbucks' could match
+    a business with 'not' in the name).
+
+    Conservative: only strips a recognized prefix from the START. If
+    the input doesn't begin with one, returns the original text
+    unchanged. Quotes / smart-quotes / leading punctuation are stripped
+    after the prefix is removed."""
+    if not text:
+        return ""
+    s = text.strip()
+    s_lower = s.lower()
+    for prefix in _NEGATION_PREFIXES:
+        if s_lower.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    # Strip leading/trailing quotes / smart-quotes / punctuation that
+    # often arrive with the corrected name (e.g. lead types: "no its
+    # 'Starbucks Coffee Company'" → after prefix strip: "'Starbucks
+    # Coffee Company'" → strip quotes → "Starbucks Coffee Company").
+    return s.strip(" '\"`‘’“”.,;:!?").strip()
+
+
+_OVERRIDE_PHRASES = (
+    "verified",
+    "i verified",
+    "i've verified",
+    "ive verified",
+    "override",
+    "i confirmed",
+    "i've confirmed",
+    "i confirm",
+    "i added it",
+    "i added the",
+    "added it already",
+    "i already added",
+    "it's there",
+    "its there",
+    "it is there",
+    "trust me",
+    "skip",
+    "skip this",
+    "manual review",
+    "have a team check",
+    "have your team check",
+    "let your team verify",
+)
+
+
+def _looks_like_override(text: str) -> bool:
+    """True when the lead's input clearly asserts they've fixed the
+    disqualification reason and wants to bypass the recheck loop.
+    Conservative — matches a short list of explicit phrases so we don't
+    accidentally trigger the override on tangential inputs. Used by
+    the disqualified-state handler after 2+ recheck attempts have
+    already failed."""
+    if not text:
+        return False
+    s = (text or "").strip().lower()
+    if not s:
+        return False
+    return any(p in s for p in _OVERRIDE_PHRASES)
+
+
+def _qualify_diag(place: dict, fail_reason: str | None) -> dict:
+    """Build a structured diagnostic dict for a disqualification so
+    anna+team can diagnose 'Google Maps shows a website but the bot says
+    no website' false negatives (live prod 2026-05-19: SALWAH JEWELRY had
+    a website link visible on Google Maps but the API's `websiteUri` was
+    empty because the lead set the link via a non-canonical field).
+
+    Returns the diag as a dict that the caller folds into its `_emit`
+    diag, so it lands in the job RESULT (visible in /runs) — NOT printed
+    to stdout. Live prod 2026-05-20: this used to `print()` a
+    `qualify_disqual ...` line to stdout, but the sandbox merges
+    stderr→stdout and `skill_invoke` parses the whole stdout as JSON
+    (`json.loads(out_str)`). Any disqualification corrupted that JSON →
+    the parser returned `{}` → empty reply → the lead saw NOTHING after
+    confirming a business that didn't qualify (Jaffa grills & kebab → no
+    website; Hennighausen Olsen & McCrea → <10 reviews). Only the JSON
+    line may go to stdout now."""
+    if not fail_reason:
+        return {}
+    return {
+        "qualify_disqual": fail_reason,
+        "place_id": (place or {}).get("place_id", "?"),
+        "name": (place or {}).get("name", "?"),
+        "websiteUri": (place or {}).get("websiteUri")
+                      or (place or {}).get("website") or "(empty)",
+        "rating": (place or {}).get("rating", "?"),
+        "userRatingCount": (place or {}).get("userRatingCount")
+                           or (place or {}).get("user_ratings_total") or 0,
+        "hours_present": bool((place or {}).get("regular_opening_hours")
+                              or (place or {}).get("opening_hours")),
+        "business_status": (place or {}).get("business_status", "?"),
+        "google_maps_uri": (place or {}).get("google_maps_uri", "?"),
+    }
+
+
+def _check_non_data_input(text: str, *, current_step: str,
+                          reprompt_key: str) -> dict | None:
+    """Shared gate for the data-collection states (awaiting_full_name /
+    email / phone): when the lead's input is clearly NOT the data we
+    asked for (a question, chitchat, complaint, etc.), don't try to
+    extract data from it. Either stay silent so the LLM's own reply is
+    the only thing the lead sees (when classifier hint is present),
+    or re-emit the relevant prompt (when no hint — internal call,
+    scheduled rerun, or LLM tool-call passthrough).
+
+    Returns an `_emit` dict when the input is non-data (caller returns
+    it directly), or None when the input might be real data and the
+    caller should continue with its normal extraction.
+
+    Live prod 2026-05-19 (Mohamed): the LLM's tool call passed "who's
+    the founder?" into awaiting_full_name → the existing validator
+    didn't catch it (no question detector) → lead.full_name was
+    stamped as "who's the founder?" → state moved to awaiting_email
+    and pricing follow-up hung the LLM tool loop for 4+ minutes.
+    """
+    if not text:
+        return None
+    _cls = matcher.current_classification() or {}
+    _intent = (_cls.get("intent") or "").strip()
+    _conf = float(_cls.get("confidence") or 0.0)
+    _by_hint = _conf >= 0.55 and _intent in _NON_DATA_INTENTS
+    _by_regex = (
+        matcher.looks_like_question(text)
+        or matcher.looks_like_intent_to_proceed(text)
+    )
+    if not (_by_hint or _by_regex):
+        return None
+    # Always re-prompt with the relevant clean template, regardless of
+    # whether the classifier hint is present. Why: when called via
+    # SDR-direct (hint present), the lead needs visible feedback or the
+    # bot looks broken. When called via the LLM gateway's tool loop
+    # (no hint passed to tool args), the LLM relays the re-prompt
+    # verbatim per behavior_rules — which produces coherent output
+    # like "I'm doing great. ⏎ Could you share your business name?"
+    # The earlier silent-when-no-hint design risked the LLM saying
+    # nothing if it interpreted "no SDR reply" as "no need to respond"
+    # — Mohamed's onboarding hung for 4+ min in exactly that mode.
+    return _emit(messages.render(reprompt_key), current_step,
+                 diag={"non_data_input": True,
+                       "hint_intent": _intent or "none",
+                       "detector": "hint" if _by_hint else "regex"})
 
 
 def _append_oya_utm(url: str) -> str:
@@ -277,13 +531,31 @@ def _release_slot() -> None:
 _RE_ENGAGE_DEFAULT_SECONDS = 600  # 10 minutes
 
 
-def _mark_complete(st: dict) -> None:
+# Completions reached because the lead is ALREADY a customer (active paid
+# account, or a lapsed/returning account). These leads already received
+# their correct terminal message — login + support info for active, the
+# reactivation Calendly link for returning. The onboarding-flavored
+# `completion_followup_ack` ("team will call to finish setting up your free
+# trial") is WRONG for them: anna+team confirmed they never call active
+# customers, and returning customers are reactivating, not starting a
+# trial. The cooldown handler stays silent for these reasons rather than
+# echoing the onboarding promise.
+_EXISTING_CUSTOMER_COMPLETE_REASONS = {"active_customer", "returning_customer"}
+
+
+def _mark_complete(st: dict, reason: str | None = None) -> None:
     """Transition to `complete` and stamp completion time. Centralizing this
     means every path that ends a conversation (success, failure, timeout,
     active-customer redirect, returning-customer redirect) participates in
-    the cooldown logic."""
+    the cooldown logic.
+
+    `reason` records WHY the conversation completed so the cooldown
+    re-engagement handler can tailor follow-ups — e.g. an active customer
+    must never be told "someone will call you to set up your trial"."""
     st["step"] = "complete"
     st["completed_at"] = datetime.now(timezone.utc).isoformat()
+    if reason:
+        st["complete_reason"] = reason
     st.pop("completion_ack_sent", None)
     st.pop("idle_ping_sent_for", None)
 
@@ -298,6 +570,21 @@ def _within_complete_cooldown(st: dict, cooldown_seconds: int) -> bool:
         return False
     age = (datetime.now(timezone.utc) - ts).total_seconds()
     return age < cooldown_seconds
+
+
+def _seconds_since_complete(st: dict) -> float:
+    """Seconds elapsed since the conversation entered the complete
+    state. Returns infinity when there's no `completed_at` timestamp
+    (state never completed) so callers can short-circuit on the
+    'not just completed' branch."""
+    completed_at = st.get("completed_at")
+    if not completed_at:
+        return float("inf")
+    try:
+        ts = datetime.fromisoformat(completed_at)
+    except ValueError:
+        return float("inf")
+    return (datetime.now(timezone.utc) - ts).total_seconds()
 
 
 # ── Idle-ping during data collection ─────────────────────────────────────
@@ -402,24 +689,70 @@ def _drive_onboarding_sync(*, sender_id: str, st: dict, cfg: dict) -> dict:
     # Form submitted successfully. Now verify Xano if configured \u2014 bias
     # toward false-negatives (better silent success than a Calendly invite
     # without a CRM record).
+    #
+    # Verification backoff: cumulative sleep up to ~120s. Live prod
+    # 2026-05-19 incident: Mohamed onboarded Bridgeview Pet Wellness
+    # Clinic, the Bubble form submission succeeded and Xano eventually
+    # had record id=57256 with `nonPayingClient: false`, but Jumper's
+    # Bubble\u2192Xano sync took longer than the original 30s window
+    # (1+2+4+8+15) so verification timed out and the bot emitted
+    # `onboarding_error` ("team will call you") for a successful
+    # onboarding. Extending the schedule to 120s (1+2+4+8+15+30+60)
+    # gives the sync time to complete; if it STILL hasn't synced by
+    # then we fall back to the polite onboarding_error which is correct
+    # behavior for the rare "Bubble accepted but Xano never got it" path.
+    # `xano_verify_backoff_schedule` is exposed via SKILL.md as a
+    # comma-separated list of seconds so customers can tune per their
+    # webhook latency profile.
+    _backoff_raw = cfg.get("xano_verify_backoff_schedule") or "1,2,4,8,15,30,60"
+    try:
+        backoff_schedule = tuple(
+            float(x) for x in str(_backoff_raw).split(",") if x.strip()
+        )
+    except (ValueError, TypeError):
+        backoff_schedule = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0)
     cid = gmb.get("cid") or ""
     verified = False
     if cid and cfg.get("enable_xano_check"):
-        for attempt_delay in (1.0, 2.0, 4.0, 8.0, 15.0):
-            time.sleep(attempt_delay)
-            status = xano_check.gmb_status(cid)
-            if status in {"active", "inactive"}:
-                verified = True
-                break
+        # Immediate check at t=0 BEFORE any sleep — when Bubble→Xano
+        # sync is fast (sometimes <1s) the record is already there and
+        # the lead gets the Calendly link without waiting a full
+        # backoff cycle. Live prod 2026-05-19: the old "sleep first
+        # then check" cost up to 30-120s of waiting even when the
+        # record had already synced in the first second.
+        status = xano_check.gmb_status(cid)
+        if status in {"active", "inactive"}:
+            verified = True
+        else:
+            for attempt_delay in backoff_schedule:
+                time.sleep(attempt_delay)
+                status = xano_check.gmb_status(cid)
+                if status in {"active", "inactive"}:
+                    verified = True
+                    break
 
     _mark_complete(st)
     state_mod.save(sender_id, st)
     if verified or not cfg.get("enable_xano_check"):
         return _emit(messages.render("calendly_book_template"), "complete",
                      diag={"onboarding": "ok", "xano_verified": verified})
-    return _emit(messages.render("onboarding_error"), "complete",
-                 diag={"onboarding": "unverified",
-                       "reason": "form_submitted_but_xano_record_missing"})
+    # Playback SUCCEEDED but Xano sync hasn't completed within the
+    # verify window. The record is likely on its way (Bubble→Xano
+    # webhook is usually delivered within minutes). Send the optimistic
+    # template with the Calendly link so the lead has a clear path
+    # forward — they can book the call, and the team can verify the
+    # Xano record async. Live prod 2026-05-19: records id 57256,
+    # 57257, 57260 all confirmed in Xano shortly AFTER the bot sent
+    # the misleading onboarding_error template; with this branch the
+    # lead would have seen the Calendly link in the same turn.
+    cal_url = (cfg.get("calendly_url") or "").strip()
+    return _emit(
+        messages.render("onboarding_unverified_optimistic", calendly_url=cal_url),
+        "complete",
+        diag={"onboarding": "unverified_optimistic",
+              "reason": "form_submitted_xano_sync_pending",
+              "playback_ok": True},
+    )
 
 
 def _enter_or_continue_queue(*, sender_id: str, st: dict, cfg: dict,
@@ -482,10 +815,23 @@ def _start_browser_onboarding(*, sender_id: str, st: dict, cfg: dict,
     )
 
 
-def run(text: str, sender_id: str) -> dict:
+def run(text: str, sender_id: str, classification: dict | None = None) -> dict:
     if not sender_id:
         return _emit(None, "error", diag={"error": "missing_sender_id"})
 
+    # Wire the gateway's Gemini Flash classification hint into matcher's
+    # module-global so each matcher (`is_affirmative`, `looks_like_closing`,
+    # `extract_phone`, etc.) prefers the typed intent over its regex floor.
+    # Cleared at end-of-turn to avoid cross-turn leakage on the long-running
+    # sandbox process. None = no hint; matchers fall back to regex.
+    matcher.set_classification(classification)
+    try:
+        return _run_with_classification(text, sender_id)
+    finally:
+        matcher.clear_classification()
+
+
+def _run_with_classification(text: str, sender_id: str) -> dict:
     cfg = oya_runtime.config()
     debounce_seconds = _config_int("debounce_seconds", 4)
     onboarding_timeout = _config_int("onboarding_timeout_seconds", 120)
@@ -626,19 +972,85 @@ def run(text: str, sender_id: str) -> dict:
     # After the cooldown, treat as a fresh conversation (the original
     # behavior — useful when a lead returns days later with a new business).
     if step == "complete" and not text_clean.startswith("__"):
-        cooldown = _config_int("re_engage_after_seconds", _RE_ENGAGE_DEFAULT_SECONDS)
-        if _within_complete_cooldown(st, cooldown):
-            if not st.get("completion_ack_sent"):
-                st["completion_ack_sent"] = True
-                state_mod.save(sender_id, st)
-                return _emit(messages.render("completion_followup_ack"), "complete",
-                             diag={"in_cooldown": True})
-            return _emit(None, "complete",
-                         diag={"in_cooldown": True, "ack_already_sent": True})
-        st = {"step": "awaiting_name", "name_buffer": []}
-        state_mod.save(sender_id, st)
-        return _emit(messages.render("welcome_template"), "awaiting_name",
-                     diag={"re_engaged": True})
+        # Bypass the cooldown when the lead provides a clearly NEW
+        # business signal (address or business_name). Live prod 2026-05-19:
+        # Mohamed onboarded Starbucks → Xano flagged it as an active
+        # customer → state moved to complete → he typed a different
+        # address ("11700 Olio Rd") for a different business → the
+        # cooldown's followup_ack fired ("Got it! Someone from our team
+        # will give you a quick call shortly") which sounded final and
+        # locked him out for 10+ min. Detecting the new business signal
+        # lets him pivot to a different onboarding immediately.
+        _hint_cls_complete = matcher.current_classification() or {}
+        _hint_intent_complete = (_hint_cls_complete.get("intent") or "")
+        _hint_conf_complete = float(_hint_cls_complete.get("confidence") or 0.0)
+        _looks_like_new_business = (
+            _looks_like_address(text_clean)
+            or (_hint_conf_complete >= 0.55
+                and _hint_intent_complete in {"business_name", "address"})
+        )
+        if _looks_like_new_business:
+            st = {"step": "awaiting_name", "name_buffer": []}
+            state_mod.save(sender_id, st)
+            # Don't re-emit the full welcome — the lead already sees the
+            # bot, just process the new business immediately. Falls
+            # through to the awaiting_name handler below.
+            step = "awaiting_name"
+        else:
+            cooldown = _config_int("re_engage_after_seconds", _RE_ENGAGE_DEFAULT_SECONDS)
+            if _within_complete_cooldown(st, cooldown):
+                # Existing-customer completions (active or returning) already
+                # got their correct terminal message and must NOT receive the
+                # onboarding-flavored completion_followup_ack. Live prod
+                # 2026-05-20: 'Life by Pilates NJ' was an active customer
+                # ("you already have an account, please log in"), then said
+                # "Thanks" and got "team will give you a quick call shortly to
+                # finish setting up your free Jumper Local trial" — promising a
+                # call+trial to a paying customer. anna+team never call active
+                # customers. Stay silent for these; a NEW business signal still
+                # re-routes above via `_looks_like_new_business`.
+                if st.get("complete_reason") in _EXISTING_CUSTOMER_COMPLETE_REASONS:
+                    return _emit(None, "complete",
+                                 diag={"in_cooldown": True,
+                                       "existing_customer_silent":
+                                           st.get("complete_reason"),
+                                       "input": text_clean[:40]})
+                # Suppress completion_followup_ack on ANY closing or
+                # affirmative acknowledgement, regardless of timing.
+                # Live prod 2026-05-19: anna+team customized
+                # `completion_followup_ack` to the same copy as
+                # `onboarding_error`, so even a 'thx' a couple minutes
+                # after the terminal message produced an identical
+                # echo. The followup_ack template is for substantive
+                # re-engagements ('hey did this work?'), not for
+                # acknowledging the bot's just-sent reply. If the lead
+                # types 'thx' / 'ok' / 'cool' / 'got it', stay silent.
+                # The cooldown window still applies for non-ack inputs
+                # (questions, sentences) which DO get the followup_ack.
+                _is_ack = (
+                    matcher.looks_like_closing(text_clean)
+                    or matcher.is_affirmative(text_clean)
+                )
+                if _is_ack:
+                    # Mark the slot used so a second knee-jerk message
+                    # ("ok thanks") doesn't trigger anything either.
+                    st["completion_ack_sent"] = True
+                    state_mod.save(sender_id, st)
+                    return _emit(None, "complete",
+                                 diag={"in_cooldown": True,
+                                       "suppressed_ack": True,
+                                       "input": text_clean[:40]})
+                if not st.get("completion_ack_sent"):
+                    st["completion_ack_sent"] = True
+                    state_mod.save(sender_id, st)
+                    return _emit(messages.render("completion_followup_ack"), "complete",
+                                 diag={"in_cooldown": True})
+                return _emit(None, "complete",
+                             diag={"in_cooldown": True, "ack_already_sent": True})
+            st = {"step": "awaiting_name", "name_buffer": []}
+            state_mod.save(sender_id, st)
+            return _emit(messages.render("welcome_template"), "awaiting_name",
+                         diag={"re_engaged": True})
 
     # Trigger / fresh conversation.
     if step == "new":
@@ -661,6 +1073,81 @@ def run(text: str, sender_id: str) -> dict:
             st["name_buffer"] = []
             state_mod.save(sender_id, st)
             return _emit(messages.render("self_company_response"), "awaiting_name")
+        # Acknowledgements / non-name replies: when the lead types "ok lets
+        # go" / "yes" / "sure" / "thanks" / "hello" in response to the
+        # welcome (or after an LLM answer in the same state), treat it as
+        # a non-name signal and re-emit the prompt. Without this, the
+        # script feeds the acknowledgement to Places.text_search, gets 0
+        # results, and replies with the confusing NOT_FOUND message
+        # ("couldn't find that listing on Google") — exactly what
+        # happened to Mohamed on 2026-05-19 after the LLM answered his
+        # pricing question and he said "ok lets go".
+        # State-aware non-name gate. Two flavors:
+        #   1. Classifier hint is present (LLM-routed turn — the gateway
+        #      dispatcher classified and is ALSO firing the agent's tool
+        #      loop, which produces its own user-facing reply). For intents
+        #      that signal "this isn't a business name" (greeting / question /
+        #      closing / affirmative / negative / complaint / off_topic /
+        #      email / phone / full_name), return reply=None so the SDR
+        #      stays silent and the LLM's reply is the only thing the
+        #      lead sees. This stops the prod bug where "how are you?"
+        #      got "I'm doing great" from the LLM CONCATENATED with the
+        #      NOT_FOUND template from the SDR's _process_name call.
+        #   2. No classifier hint (scheduled rerun, debounce defer-fire,
+        #      sandbox test, dispatcher classifier failed): fall back to
+        #      a clean re-prompt so the lead isn't left wondering whether
+        #      the bot heard them. Uses ask_business_name_when_address
+        #      template (existing copy: "What's the name of your business?").
+        _hint_cls = matcher.current_classification() or {}
+        _hint_intent_now = (_hint_cls.get("intent") or "")
+        _hint_conf = float(_hint_cls.get("confidence") or 0.0)
+        # NOTE: `full_name` is intentionally NOT in this set. We're asking
+        # for the lead's BUSINESS name here, and a huge share of local
+        # businesses are named after a person — contractors, law firms,
+        # dentists, salons, realtors. Live prod 2026-05-20: "Richard P.
+        # Koenig Gen Contractor" was classified `full_name` (it leads with
+        # a person name) and the gate rejected it three times with "Could
+        # you share your business name?" while the lead insisted "I just
+        # did". A person-name-shaped string must flow through to Places —
+        # if it's a real business, Places finds it and we confirm; if not,
+        # _process_name's NOT_FOUND re-prompt handles it.
+        _NON_NAME_INTENTS = {
+            "greeting", "question", "closing", "affirmative", "negative",
+            "complaint", "off_topic", "email", "phone",
+            "small_talk",  # forward-compat for the chitchat fast-path
+        }
+        _is_non_name_by_hint = (
+            _hint_conf >= 0.55 and _hint_intent_now in _NON_NAME_INTENTS
+        )
+        _is_non_name_by_regex = (
+            matcher.looks_like_closing(text_clean)
+            or matcher.is_affirmative(text_clean)
+            # Catches "how are you?", "what's up?", "u there?" coming via
+            # the agent's LLM tool-call path where the dispatcher's
+            # classification hint isn't propagated.
+            or matcher.looks_like_question(text_clean)
+            # Catches "i wanna sign up", "let's get started", "i'm ready",
+            # "sign me up" — intent-to-proceed phrases that aren't
+            # business names. Defense in depth: works even when the
+            # classifier returns `other` and we have no hint to gate on
+            # (live prod 2026-05-19, the classifier prompt update for
+            # affirmative had not yet deployed).
+            or matcher.looks_like_intent_to_proceed(text_clean)
+        )
+        if _is_non_name_by_hint or _is_non_name_by_regex:
+            # Always re-prompt with the clean `ask_business_name` template
+            # (the older `ask_business_name_when_address` said "I couldn't
+            # find a business at that address" — misleading for inputs
+            # like "who's life?" / "are you stupid?" that aren't addresses).
+            # Re-prompting in both SDR-direct and LLM-tool-call paths means
+            # the lead always sees a coherent message: in SDR-direct it's
+            # the only reply; in LLM-tool-call the LLM relays it verbatim
+            # alongside its own answer if any.
+            return _emit(messages.render("ask_business_name"),
+                         "awaiting_name",
+                         diag={"non_name_input": True,
+                               "hint_intent": _hint_intent_now or "none",
+                               "detector": "hint" if _is_non_name_by_hint else "regex"})
         # Lead pasted an address as their business name. The default
         # text_search call would return a literal-address entity ("11689
         # Olio Rd") which fails qualification with a misleading "no
@@ -751,19 +1238,109 @@ def run(text: str, sender_id: str) -> dict:
                 sender_id=sender_id, st=st, full_name=text_clean,
                 min_reviews=min_reviews, min_rating=min_rating,
             )
-        if matcher.is_negative(text_clean) or text_clean:
-            # Treat anything else as a refined name → re-search.
+        # Pure negative ("no", "nope", "wrong", "nah", "incorrect"): the
+        # lead is rejecting the candidate but hasn't yet provided the
+        # CORRECT business name. Without this branch, the script falls
+        # through to _process_name(joined_name="no") and Places
+        # fuzzy-matches "no" to "No 1911 Inc" in Baker City Oregon
+        # (live prod 2026-05-19) — a real but utterly unrelated business.
+        # Same trap on "nope" → various businesses. Re-prompt for the
+        # actual business name.
+        _is_pure_negative = (
+            matcher.is_negative(text_clean)
+            and len(text_clean.split()) <= 2
+        )
+        if _is_pure_negative:
+            st["candidate_gmb"] = None
             st["step"] = "awaiting_name"
             st["name_buffer"] = []
             state_mod.save(sender_id, st)
-            return _process_name(sender_id=sender_id, st=st, joined_name=text_clean,
-                                 min_reviews=min_reviews, min_rating=min_rating)
+            return _emit(messages.render("ask_business_name"),
+                         "awaiting_name",
+                         diag={"rejected_candidate": True})
+        # Lead provided an address as the do-over ("202 S Franklin St,
+        # Chicago, IL 60606" — live prod 2026-05-19). Route to the
+        # address-lookup helper so nearby_search finds the actual
+        # business at those coordinates, rather than text_search
+        # returning the literal-address entity (which has no hours /
+        # website / reviews and immediately disqualifies on the next
+        # turn). Same trap that hit the awaiting_name handler before we
+        # added its _looks_like_address gate.
+        if _looks_like_address(text_clean):
+            st["candidate_gmb"] = None
+            st["step"] = "awaiting_name"
+            st["name_buffer"] = []
+            state_mod.save(sender_id, st)
+            return _process_address_lookup(
+                sender_id=sender_id, st=st, address=text_clean,
+                min_reviews=min_reviews, min_rating=min_rating,
+            )
+        if matcher.is_negative(text_clean) or text_clean:
+            # Treat anything else as a refined name → re-search. Combine
+            # with the lead's previously-typed address (if known) so we
+            # don't lose the address context when the lead corrects the
+            # business name. Live prod 2026-05-19: "no its 'Starbucks
+            # Coffee Company'" after a wrong-GMB offer at 9001 E 116th
+            # St → script used to throw away the address and re-search
+            # just the business name → Places returned multiple Starbucks
+            # → asked for address again. Now we re-combine and re-search.
+            cleaned_name = _strip_negation_prefix(text_clean)
+            prev_addr = (
+                st.get("last_address_input")
+                or (st.get("candidate_gmb") or {}).get("formatted_address", "")
+                or ""
+            )
+            joined = (
+                f"{cleaned_name} {prev_addr}".strip()
+                if (prev_addr and cleaned_name)
+                else (cleaned_name or text_clean)
+            )
+            st["step"] = "awaiting_name"
+            st["name_buffer"] = []
+            state_mod.save(sender_id, st)
+            # `after_address_round=True` picks the first candidate when
+            # there's only one — fine here because the combined query is
+            # specific enough to land on the right business.
+            return _process_name(
+                sender_id=sender_id, st=st, joined_name=joined,
+                min_reviews=min_reviews, min_rating=min_rating,
+                after_address_round=bool(prev_addr),
+            )
         return _emit(messages.render("confirm_one"), "awaiting_gmb_confirm")
 
     # Lead-info collection.
     if step == "awaiting_full_name":
         if not text_clean:
             return _emit(messages.render("ask_full_name"), "awaiting_full_name")
+        # Reject obvious non-name replies — without this, "yes" / "ok" / "k"
+        # land in `lead.full_name` and the lead's downstream dashboard is
+        # stamped with garbage. Three live cases on 2026-05-18: leads typed
+        # "yes" expecting to confirm something and the bot accepted it as
+        # their name. Don't gate on length alone — "Anna" / "Bob" / "Jay"
+        # are legitimate first-only replies.
+        # ALSO reject question-shaped inputs. Live prod 2026-05-19:
+        # Mohamed asked "who's the founder?" while in awaiting_full_name.
+        # The LLM gateway path handled the question correctly (KB answer
+        # via behaviour_rules), but the LLM also called oya_messenger_sdr
+        # as a tool with text="who's the founder?" — which the SDR
+        # accepted as the lead's full_name. State moved to awaiting_email
+        # with `lead.full_name = "who's the founder?"`. The validator now
+        # checks for question shape (classifier hint or regex) and stays
+        # silent / re-prompts.
+        _non_data = _check_non_data_input(
+            text_clean, current_step="awaiting_full_name",
+            reprompt_key="ask_full_name",
+        )
+        if _non_data is not None:
+            return _non_data
+        if (matcher.is_affirmative(text_clean) or matcher.is_negative(text_clean)
+                or matcher.looks_like_closing(text_clean)
+                or matcher.looks_like_email(text_clean)
+                or len(text_clean) < 2
+                or text_clean.isdigit()):
+            return _emit(messages.render("ask_full_name"), "awaiting_full_name",
+                         diag={"reject_full_name": "looks_non_name",
+                               "input": text_clean[:40]})
         lead = dict(st.get("lead") or {})
         lead["full_name"] = text_clean
         st["lead"] = lead
@@ -775,17 +1352,38 @@ def run(text: str, sender_id: str) -> dict:
         return _emit(messages.render("ask_email"), "awaiting_email")
 
     if step == "awaiting_email":
+        # Reject question-shaped or chitchat inputs (see awaiting_full_name).
+        # Without this, an LLM tool call that passes a question through
+        # would extract_email() → None → re-emit ask_email, leaving the
+        # lead confused. With this, the SDR stays silent so the LLM's
+        # own KB-grounded answer (when present) is the only reply.
+        _non_data = _check_non_data_input(
+            text_clean, current_step="awaiting_email",
+            reprompt_key="ask_email",
+        )
+        if _non_data is not None:
+            return _non_data
         email = matcher.extract_email(text_clean)
         if not email:
             return _emit(messages.render("ask_email"), "awaiting_email")
+        # Reject obvious placeholder emails BEFORE the browser playback
+        # would attempt to register them with Bubble (and fail at the
+        # form-validation step, surfacing the misleading onboarding_error
+        # template). Live prod 2026-05-19: 'test+test@email.com' passed
+        # the existing extract_email regex.
+        if matcher.looks_like_test_email(email):
+            return _emit(messages.render("ask_email_again_test_address"),
+                         "awaiting_email",
+                         diag={"reject_email": "placeholder",
+                               "input": email[:60]})
         status = xano_check.email_status(email)
         if status == "active":
-            _mark_complete(st)
+            _mark_complete(st, reason="active_customer")
             state_mod.save(sender_id, st)
             return _emit(messages.render("active_account_template"), "complete",
                          diag={"customer": "active"})
         if status == "inactive":
-            _mark_complete(st)
+            _mark_complete(st, reason="returning_customer")
             state_mod.save(sender_id, st)
             return _emit(messages.returning_with_url(
                 cfg.get("returning_calendly_url") or "",
@@ -802,9 +1400,25 @@ def run(text: str, sender_id: str) -> dict:
         return _emit(messages.render("ask_phone"), "awaiting_phone")
 
     if step == "awaiting_phone":
+        # Same non-data gate as awaiting_full_name / awaiting_email.
+        _non_data = _check_non_data_input(
+            text_clean, current_step="awaiting_phone",
+            reprompt_key="ask_phone",
+        )
+        if _non_data is not None:
+            return _non_data
         phone = matcher.extract_phone(text_clean)
         if not phone:
             return _emit(messages.render("ask_phone"), "awaiting_phone")
+        # Reject obvious placeholder phone numbers BEFORE the browser
+        # playback. Live prod 2026-05-19 surfaced fake data like
+        # 5555555555 / 1234567890 — the extract_phone regex was happy
+        # with them but Bubble's form validation would reject them.
+        if matcher.looks_like_test_phone(phone):
+            return _emit(messages.render("ask_phone_again_test_number"),
+                         "awaiting_phone",
+                         diag={"reject_phone": "placeholder",
+                               "input": phone[:30]})
         lead = dict(st.get("lead") or {})
         lead["phone"] = phone
         st["lead"] = lead
@@ -873,25 +1487,82 @@ def run(text: str, sender_id: str) -> dict:
     # recheck of the previously-disqualified Kava). Falls back to the
     # original recheck path when Places returns nothing.
     if step in {"disqualified_hours", "disqualified_website", "disqualified_reviews", "disqualified_rating"}:
-        # Conversational closings ("thx", "thanks", "thank you", "got it")
-        # are silent — they're a polite acknowledgement, not a recheck
-        # signal and not a new search. Without this, "thx" falls through
-        # the recheck path and re-emits the disqual message; "thank you"
-        # gets fed to Places and surfaces "Thank You Berry Much Farms",
-        # an unrelated business in Oregon. Both observed live on
-        # 2026-05-08 in Anna's Jumper SDR thread.
+        # Conversational closings ("thx", "thanks", "thank you", "got it",
+        # "ok", "okay", "okaaay") are silent — polite acknowledgements,
+        # not recheck signals and not a new search. Without this, "okaaay"
+        # falls through into Places text_search and surfaces "OKY App", a
+        # business in Florida unrelated to the disqualified GMB; "thank
+        # you" surfaces "Thank You Berry Much Farms" in Oregon. Both were
+        # observed live (Noor 2026-05-19, Anna 2026-05-08). Classifier
+        # hint catches "okaaay" / "okay" / variants the regex floor misses.
         if text_clean and matcher.looks_like_closing(text_clean):
             return _emit(None, step, diag={"closing": True})
+        # Manual-override escape: after 2 recheck attempts have already
+        # failed AND the lead claims they've fixed the issue ("verified",
+        # "i confirmed", "override", "i added it"), trust the lead, flag
+        # the conversation for human review, and resume the flow at
+        # awaiting_full_name. Live prod 2026-05-19: SALWAH JEWELRY had a
+        # website on Google Maps but the Places API returned no
+        # `websiteUri`. Without this escape the lead loops forever.
+        # Anna+team see the `manual_review_requested` flag on state and
+        # can spot-check the GMB in their Bubble dashboard.
+        _override_attempts = int(st.get("recheck_attempts") or 0)
+        if text_clean and _override_attempts >= 2 and _looks_like_override(text_clean):
+            lead = dict(st.get("lead") or {})
+            lead["manual_review_requested"] = True
+            lead["manual_review_reason"] = st.get("disqual_reason") or "unspecified"
+            st["lead"] = lead
+            st["step"] = "awaiting_full_name"
+            st.pop("idle_ping_sent_for", None)
+            st.pop("recheck_attempts", None)
+            state_mod.save(sender_id, st)
+            _schedule_idle_ping(sender_id=sender_id,
+                                delay_seconds=_config_int("idle_ping_seconds", 180))
+            return _emit(messages.render("disqual_override_acknowledged"),
+                         "awaiting_full_name",
+                         diag={"manual_override": True,
+                               "previous_disqual": st.get("disqual_reason")})
+        # Address do-over: lead pastes a street address while disqualified.
+        # Real prod 2026-05-19 — Mohamed got disqualified on Kava Espresso
+        # (no website), then typed "5560 N Illinois St, Indianapolis, IN
+        # 46208" expecting the bot to look up the business at that
+        # address. Without this branch the script falls through to the
+        # recheck path on the OLD GMB and re-emits the disqual message,
+        # which is dead-end UX — the lead has to type MAPS to retry.
+        # Route address inputs through the nearby-business resolver
+        # (same as awaiting_name handles) so the lead can switch
+        # businesses without resetting state.
+        if text_clean and _looks_like_address(text_clean):
+            st["step"] = "awaiting_name"
+            st["name_buffer"] = []
+            st["candidate_gmb"] = None
+            st["disqual_reason"] = None
+            state_mod.save(sender_id, st)
+            return _process_address_lookup(
+                sender_id=sender_id, st=st, address=text_clean,
+                min_reviews=min_reviews, min_rating=min_rating,
+            )
+        # Restrict the "new business name" fast-path to inputs the
+        # classifier flagged as business_name OR (when no classifier hint)
+        # to inputs that actually look like a name search — not a single
+        # short token that Places would fuzzy-match to anything ("Okaaay" →
+        # "OKY App"). Either trust the classifier or require ≥ 2 tokens.
         if text_clean and not matcher.is_affirmative(text_clean):
-            new_candidates = places.text_search(text_clean)
-            if new_candidates:
-                st["step"] = "awaiting_name"
-                st["name_buffer"] = []
-                state_mod.save(sender_id, st)
-                return _process_name(
-                    sender_id=sender_id, st=st, joined_name=text_clean,
-                    min_reviews=min_reviews, min_rating=min_rating,
-                )
+            looks_like_new_search = (
+                matcher.hint_is_business_name(text_clean) is True
+                or (matcher.hint_is_business_name(text_clean) is None
+                    and len(text_clean.split()) >= 2)
+            )
+            if looks_like_new_search:
+                new_candidates = places.text_search(text_clean)
+                if new_candidates:
+                    st["step"] = "awaiting_name"
+                    st["name_buffer"] = []
+                    state_mod.save(sender_id, st)
+                    return _process_name(
+                        sender_id=sender_id, st=st, joined_name=text_clean,
+                        min_reviews=min_reviews, min_rating=min_rating,
+                    )
         gmb = st.get("candidate_gmb") or {}
         place_id = gmb.get("place_id")
         if not place_id:
@@ -905,9 +1576,11 @@ def run(text: str, sender_id: str) -> dict:
                          step, diag={"recheck": "failed"})
         st["candidate_gmb"] = fresh
         fail = qualify.check(fresh, min_reviews=min_reviews, min_rating=min_rating)
+        _qd = _qualify_diag(fresh, fail)
         if fail is None:
             st["step"] = "awaiting_full_name"
             st.pop("idle_ping_sent_for", None)
+            st.pop("recheck_attempts", None)
             state_mod.save(sender_id, st)
             _schedule_idle_ping(sender_id=sender_id,
                                 delay_seconds=_config_int("idle_ping_seconds", 180))
@@ -915,9 +1588,33 @@ def run(text: str, sender_id: str) -> dict:
                          diag={"recheck": "passed"})
         st["step"] = _DISQUAL_STEP[fail]
         st["disqual_reason"] = fail
+        # Recheck-still-failing counter. The lead has now tried at least
+        # once and Google's API still shows the same issue. From the
+        # second still-failing onward, swap the canned per-reason
+        # template (which reads as "please add a website to your profile
+        # and try again", repeated verbatim) for the softer
+        # `disqual_recheck_still_failing` copy that acknowledges Google's
+        # propagation lag. Live prod 2026-05-19: Mohamed disqualified on
+        # missing website, said "it has website", saw the same canned
+        # message twice — felt gaslit.
+        attempts = int(st.get("recheck_attempts") or 0) + 1
+        st["recheck_attempts"] = attempts
         state_mod.save(sender_id, st)
+        if attempts >= 2:
+            what_missing = {
+                "hours": "no business hours listed",
+                "website": "no website listed",
+                "reviews": f"fewer than {min_reviews} reviews",
+                "rating": f"a rating under {min_rating}",
+            }.get(fail, "the same issue")
+            return _emit(
+                messages.render("disqual_recheck_still_failing",
+                                what_is_missing=what_missing),
+                _DISQUAL_STEP[fail],
+                diag={"recheck": "still_failing", "attempts": attempts, **_qd},
+            )
         return _emit(messages.render(_DISQUAL_MSG_KEY[fail]), _DISQUAL_STEP[fail],
-                     diag={"recheck": "still_failing"})
+                     diag={"recheck": "still_failing", "attempts": attempts, **_qd})
 
     # Already-onboarding wait state — silent on extra inbound (the lead
     # might be saying "thanks!" while we're navigating their browser).
@@ -964,9 +1661,13 @@ def _process_address_lookup(*, sender_id: str, st: dict, address: str,
 
     candidates: list[dict] = []
     if lat is not None and lng is not None:
+        # Widened from max_results=5 to max_results=10 so strip-mall
+        # alternatives surface alongside the closest candidate. Live
+        # prod 2026-05-19: '11630 Olio Rd' (a 6+ business strip mall)
+        # would otherwise only show Olio Nail & Spa.
         candidates = places.nearby_search(
             latitude=lat, longitude=lng,
-            radius_meters=75.0, max_results=5,
+            radius_meters=75.0, max_results=10,
             drop_pure_address_results=True,
         )
 
@@ -984,14 +1685,14 @@ def _process_address_lookup(*, sender_id: str, st: dict, address: str,
         gs = xano_check.gmb_status(cid)
         if gs == "active":
             st["candidate_gmb"] = gmb
-            _mark_complete(st)
+            _mark_complete(st, reason="active_customer")
             state_mod.save(sender_id, st)
             return _emit(messages.render("active_account_template"), "complete",
                          diag={"customer": "active",
                                "matched_at": "address_lookup", "cid": cid})
         if gs == "inactive":
             st["candidate_gmb"] = gmb
-            _mark_complete(st)
+            _mark_complete(st, reason="returning_customer")
             state_mod.save(sender_id, st)
             return _emit(
                 messages.returning_with_url(
@@ -1005,9 +1706,56 @@ def _process_address_lookup(*, sender_id: str, st: dict, address: str,
 
     st["candidate_gmb"] = gmb
     st["pending_name"] = gmb.get("name") or address
+    # Remember the LEAD'S original address input so we can combine it
+    # with a corrected business name if they reject the candidate.
+    # Live prod 2026-05-19: Mohamed pasted "9001 E 116th St" → bot offered
+    # AAA Fishers Office (snapped from 8997) → Mohamed said "no its
+    # Starbucks Coffee Company". Without preserved context the script
+    # threw away the address and asked for it again. With this we can
+    # search "Starbucks Coffee Company 9001 E 116th St Fishers IN" and
+    # land on the correct business in one turn.
+    st["last_address_input"] = address
     st["step"] = "awaiting_gmb_confirm"
     st["name_buffer"] = []
     state_mod.save(sender_id, st)
+    # Detect strip-mall (multiple distinct businesses at the same
+    # street number). Surface alternatives so the lead can pick.
+    siblings = _siblings_at_same_address(gmb, candidates, max_count=4)
+    snap_mismatch = _addresses_differ_significantly(
+        address, gmb.get("formatted_address", "")
+    )
+    if siblings:
+        return _emit(
+            messages.render("confirm_one_with_alternatives",
+                            name=gmb.get("name", ""),
+                            address=gmb.get("formatted_address", ""),
+                            alternatives=", ".join(siblings)),
+            "awaiting_gmb_confirm",
+            diag={"input_was_address": True,
+                  "strip_mall_alternatives": siblings,
+                  "places_results": len(candidates),
+                  "gmb_name": gmb.get("name"),
+                  "gmb_address": gmb.get("formatted_address")},
+        )
+    # If nearby_search snapped to a noticeably-different street number,
+    # be transparent. Default `confirm_one_with_listing` template silently
+    # substitutes the candidate's address — which feels like a lie when
+    # the lead typed "9001" and sees "8997" (live prod 2026-05-19,
+    # Mohamed asked "why it changed the address"). The
+    # `confirm_closest_listing` template explicitly acknowledges the snap.
+    if snap_mismatch:
+        return _emit(
+            messages.render("confirm_closest_listing",
+                            name=gmb.get("name", ""),
+                            address=gmb.get("formatted_address", "")),
+            "awaiting_gmb_confirm",
+            diag={"input_was_address": True,
+                  "address_snap_mismatch": True,
+                  "lead_address": address,
+                  "places_results": len(candidates),
+                  "gmb_name": gmb.get("name"),
+                  "gmb_address": gmb.get("formatted_address")},
+        )
     return _emit(
         messages.confirm_one_with_listing(gmb.get("name", ""),
                                           gmb.get("formatted_address", "")),
@@ -1038,7 +1786,18 @@ def _process_name(*, sender_id: str, st: dict, joined_name: str,
         state_mod.save(sender_id, st)
         return _emit(messages.render("self_company_response"), "awaiting_name")
 
-    candidates = places.text_search(joined_name)
+    # `drop_pure_address_results=True` filters out literal-address
+    # entities (`types: ["street_address" / "premise" / "subpremise" /
+    # "route"]`) from Places. Without this filter, lead inputs like
+    # "202 S Franklin St, Chicago, IL 60606" (typed in awaiting_gmb_confirm
+    # after rejecting a wrong candidate) come back with the bare address
+    # entity at the top — which has no hours, website, or reviews, so it
+    # immediately disqualifies on the next turn with a misleading "please
+    # add business hours" message. Live prod 2026-05-19. The address-lookup
+    # path (_process_address_lookup → nearby_search) is where actual
+    # businesses-at-an-address are resolved; here we only want real
+    # business entities.
+    candidates = places.text_search(joined_name, drop_pure_address_results=True)
     if not candidates:
         st["name_buffer"] = []
         st["step"] = "awaiting_name"
@@ -1063,13 +1822,13 @@ def _process_name(*, sender_id: str, st: dict, joined_name: str,
             gs = xano_check.gmb_status(cid)
             if gs == "active":
                 st["candidate_gmb"] = gmb
-                _mark_complete(st)
+                _mark_complete(st, reason="active_customer")
                 state_mod.save(sender_id, st)
                 return _emit(messages.render("active_account_template"), "complete",
                              diag={"customer": "active", "matched_at": "name_lookup", "cid": cid})
             if gs == "inactive":
                 st["candidate_gmb"] = gmb
-                _mark_complete(st)
+                _mark_complete(st, reason="returning_customer")
                 state_mod.save(sender_id, st)
                 return _emit(
                     messages.returning_with_url(
@@ -1113,6 +1872,7 @@ def _on_gmb_confirmed(*, sender_id: str, st: dict,
     # resolved. If we're here, Xano either returned None (not a known
     # customer) or the check is disabled — proceed with qualification.
     fail = qualify.check(fresh, min_reviews=min_reviews, min_rating=min_rating)
+    _qd = _qualify_diag(fresh, fail)
     if fail is None:
         st["step"] = "awaiting_full_name"
         st.pop("idle_ping_sent_for", None)
@@ -1124,7 +1884,8 @@ def _on_gmb_confirmed(*, sender_id: str, st: dict,
     st["step"] = _DISQUAL_STEP[fail]
     st["disqual_reason"] = fail
     state_mod.save(sender_id, st)
-    return _emit(messages.render(_DISQUAL_MSG_KEY[fail]), _DISQUAL_STEP[fail])
+    return _emit(messages.render(_DISQUAL_MSG_KEY[fail]), _DISQUAL_STEP[fail],
+                 diag=_qd or None)
 
 
 def _on_gmb_confirmed_with_name(*, sender_id: str, st: dict, full_name: str,
@@ -1141,6 +1902,7 @@ def _on_gmb_confirmed_with_name(*, sender_id: str, st: dict, full_name: str,
     st["candidate_gmb"] = fresh
 
     fail = qualify.check(fresh, min_reviews=min_reviews, min_rating=min_rating)
+    _qd = _qualify_diag(fresh, fail)
     if fail is None:
         lead = dict(st.get("lead") or {})
         lead["full_name"] = full_name
@@ -1158,7 +1920,8 @@ def _on_gmb_confirmed_with_name(*, sender_id: str, st: dict, full_name: str,
     st["step"] = _DISQUAL_STEP[fail]
     st["disqual_reason"] = fail
     state_mod.save(sender_id, st)
-    return _emit(messages.render(_DISQUAL_MSG_KEY[fail]), _DISQUAL_STEP[fail])
+    return _emit(messages.render(_DISQUAL_MSG_KEY[fail]), _DISQUAL_STEP[fail],
+                 diag=_qd or None)
 
 
 def _read_input() -> dict:
@@ -1174,7 +1937,10 @@ def main() -> int:
     inp = _read_input()
     text = str(inp.get("text") or "")
     sender_id = str(inp.get("sender_id") or "")
-    out = run(text=text, sender_id=sender_id)
+    classification = inp.get("classification")
+    if not isinstance(classification, dict):
+        classification = None
+    out = run(text=text, sender_id=sender_id, classification=classification)
     print(json.dumps(out, ensure_ascii=False))
     return 0
 

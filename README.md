@@ -190,8 +190,8 @@ for chunk in stream:
 - `gemini/gemini-2.0-flash`
 - `gemini/gemini-2.5-flash`
 - `gemini/gemini-2.5-pro`
-- `gemini/gemini-3-flash-preview`
-- `gemini/gemini-3-pro-preview`
+- `gemini/gemini-3.5-flash`
+- `gemini/gemini-3.1-pro-preview`
 - `anthropic/claude-sonnet-4-6`
 - `anthropic/claude-haiku-4-5-20251001`
 
