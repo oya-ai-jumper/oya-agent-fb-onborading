@@ -519,7 +519,7 @@
     {
       "platform": "facebook-messenger",
       "name": "JumperMedia",
-      "is_active": false
+      "is_active": true
     }
   ],
   "routines": [],
