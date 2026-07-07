@@ -513,11 +513,6 @@
     },
     {
       "platform": "facebook-messenger",
-      "name": "Facebook Messenger Gateway",
-      "is_active": false
-    },
-    {
-      "platform": "facebook-messenger",
       "name": "JumperMedia",
       "is_active": true
     }
