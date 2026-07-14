@@ -510,6 +510,11 @@
       "platform": "browser",
       "name": "Browser \u2014 Cloud sandbox",
       "is_active": true
+    },
+    {
+      "platform": "facebook-messenger",
+      "name": "FB SDR",
+      "is_active": true
     }
   ],
   "routines": [],
