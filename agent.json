@@ -510,17 +510,21 @@
       "platform": "browser",
       "name": "Browser \u2014 Cloud sandbox",
       "is_active": true
-    },
-    {
-      "platform": "facebook-messenger",
-      "name": "JM SDR",
-      "is_active": true
     }
   ],
   "routines": [],
   "triggers": [],
   "mcp_connections": [],
-  "memories": [],
+  "memories": [
+    {
+      "memory_type": "skill_state",
+      "content": "oya-messenger-sdr::psid:9990001112223334",
+      "metadata": {
+        "step": "awaiting_name",
+        "name_buffer": []
+      }
+    }
+  ],
   "knowledge_base": [],
   "tools_config": {}
 }
